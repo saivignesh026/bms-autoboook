@@ -1,0 +1,22 @@
+# Generated artifacts and local tools
+node_modules/
+dist/
+*.zip
+*.xpi
+*.log
+.DS_Store
+Thumbs.db
+
+# Environment-owned folders and local credentials
+.agents/
+.aws/
+.codex/
+.env
+.env.*
+*.pem
+*.key
+
+# Private source references and local browser profiles
+/tamper monkey.txt
+/private/
+/firefox-profile/

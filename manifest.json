@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "bms-autobook",
+  "version": "1.0",
+  "description": "Save seat zones, monitor availability, select seats and assist checkout with optional notifications.",
+  "permissions": [
+    "storage",
+    "notifications",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.bookmyshow.com/*",
+    "https://discord.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": [
+      "core.js",
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "bms-autobook"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.bookmyshow.com/*"
+      ],
+      "js": [
+        "core.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bms-seat-companion@local.example",
+      "strict_min_version": "128.0"
+    }
+  }
+}

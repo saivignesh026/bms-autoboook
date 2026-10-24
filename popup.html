@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bms-autobook</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body class="popup simple-popup">
+  <header class="brand">
+    <span class="brand-icon">🎫</span>
+    <div>
+      <h1>bms-autobook</h1>
+      <span class="muted">BookMyShow automation</span>
+    </div>
+    <span id="running" class="badge">Ready</span>
+  </header>
+
+  <label>Theatre profile
+    <select id="profile"></select>
+  </label>
+  <div class="actions" style="margin:10px 0">
+    <button id="profiles" class="text-button">Manage / copy profiles</button>
+  </div>
+
+  <section class="welcome">
+    <h2 id="headline">Choose a profile.</h2>
+    <p id="summary">Each profile has its own theatre, contact details and Discord channel.</p>
+  </section>
+
+  <div class="card seat-card">
+    <div class="actions between">
+      <strong>Chosen seats</strong>
+      <button id="choose" class="text-button">Adjust seats</button>
+    </div>
+    <div id="seats" class="seat-chips"></div>
+    <div id="details" class="muted"></div>
+  </div>
+
+  <button id="start" class="primary full">Start automatically</button>
+  <button id="stop" class="full danger hidden">Stop</button>
+  <div id="timer" class="popup-timer"></div>
+
+  <p class="muted centered">Start checks Discord, selects seats, fills details and opens the payment QR. You complete payment.</p>
+
+  <button id="test" class="full">Test this profile's Discord</button>
+  <div id="delivery" class="status muted"></div>
+  <div id="message" class="status" role="status"></div>
+
+  <details>
+    <summary>Activity / errors</summary>
+    <pre id="logs">No activity.</pre>
+  </details>
+
+  <script src="core.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
