@@ -1,4 +1,4 @@
-# bms-autobook
+# bms-autobook(vibe-coded)
 
 Chrome and Firefox WebExtension for monitoring saved BookMyShow seat zones, assisting checkout, and sending the payment QR and selected-seat image to a profile's Discord webhook. Payment is completed manually.
 
