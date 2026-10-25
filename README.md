@@ -44,7 +44,7 @@ The same manifest supports both browsers: Chrome uses the background service wor
 5. When the QR arrives in Discord, complete payment yourself. Keep the booking tab open for success detection and the five-minute restart timer.
 6. Click **Stop** whenever you want monitoring to end.
 
-A running cycle uses a snapshot of its profile. Different profiles can run in separate tabs. Review saved zones when changing theatres or the map's internal zoom/pan.
+A running cycle uses a snapshot of its profile. To scan multiple theatres, open each theatre in its own tab, select its profile using **Profile for this tab** in the page panel or extension popup, and start each scan. Each tab remembers its own selection across page reloads; selecting a profile in another tab does not change it. Stopping a scan only stops that tab. Review saved zones when changing theatres or the map's internal zoom/pan.
 
 ## Project layout
 
@@ -79,3 +79,7 @@ The minimal reference functions in `tests/fixtures/tampermonkey-v67.js` contain 
 Profiles and booking images are stored in extension storage. Contact details are used for checkout; the configured Discord webhook receives notifications and captured images. Webhook details stay in the background context. Capture uses the bundled library, without browser screenshot permissions or external image hosting.
 
 Permissions are limited to extension storage, notifications, script execution, BookMyShow hosts, and Discord. Keep webhook URLs and personal profile exports out of source control. The bundled dependency's license is in `vendor/html2canvas.LICENSE.txt`.
+
+Start and Save & start reload only the current booking tab once before monitoring resumes. Seat images combine the live layout and selection canvas layers so the selected seats retain their surrounding layout.
+
+Version 1.7 adds an extension background watchdog for every running tab. Firefox receives two-second background nudges while the background page is awake, backed by a recurring 30-second browser alarm. Overdue watching-page reloads are handled in the background; checkout/payment pages are never reloaded by this recovery. The Activity log reports unresponsive page helpers. Browser suspension and hidden-page rendering can still delay progress. The alarms permission is required.

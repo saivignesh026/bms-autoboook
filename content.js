@@ -9,10 +9,9 @@
   const CHECK_MS = 500;
   let profile, config, state = { running: false }, busy = false, editing = null, lastPoll = 0, notice = 'Select a theatre profile using the extension button.', lastDraw = '', localCheck = 0, quantityStep = 0, quantityAt = 0;
 
-  // Keep DOM image/canvas creation in the page realm, as in the userscript.
-  // Only the resulting data URL crosses back into the extension.
+  // Seat images copy the live selected map; QR capture runs in the page realm.
   const BMSCapture = {
-    seat: () => send({ type: 'capturePage', runId: state.runId, kind: 'seat' }),
+    seat: async () => captureSelectedSeats(),
     qr: () => send({ type: 'capturePage', runId: state.runId, kind: 'qr' })
   };
 
@@ -22,7 +21,7 @@
   const root = host.attachShadow({ mode: 'closed' });
   root.innerHTML = `<style>
   :host{all:initial}*{box-sizing:border-box}#panel{position:fixed;right:16px;bottom:16px;width:300px;max-height:75vh;overflow:auto;z-index:2147483645;font:13px/1.5 system-ui,sans-serif;color:#f2f6ff;background:#14203a;border:1px solid #405477;border-radius:14px;padding:14px;box-shadow:0 12px 40px #0005}header{display:flex;justify-content:space-between;align-items:center;font-weight:700}button{font:inherit;cursor:pointer;border:1px solid #52698e;border-radius:7px;padding:6px 9px;background:#2b4165;color:#fff;margin:5px 3px 0 0}button:hover{background:#405e8f}#stop{background:#a23c57}#timer{font-size:22px;font-weight:750;color:#a8d5ff;line-height:1.3;margin:10px 0}#status{margin:8px 0;color:#dae6fb;overflow-wrap:anywhere}#hint,#schedule{font-size:11px;color:#a4b8d9}#delivery{color:#a6e3be;font-size:12px;margin:6px 0}#delivery.error{color:#ffb3b3}#logs{font-size:11px;white-space:pre-wrap}#zones{position:fixed;inset:0;pointer-events:none;z-index:2147483643}.zone{position:fixed;border:3px solid red;background:transparent;pointer-events:none}.zone span{position:absolute;top:-18px;left:-3px;background:red;color:white;padding:1px 4px;font:10px system-ui;white-space:nowrap}#draw{position:fixed;border:2px dashed #76a7ff;background:#76a7ff12;cursor:crosshair;touch-action:none;z-index:2147483644}#draft{position:absolute;border:3px dashed blue;background:rgba(0,0,255,0.2);pointer-events:none}.hidden{display:none!important}details{margin-top:8px}summary{cursor:pointer;color:#b9cbea;font-size:11px}
-  </style><div id="zones"></div><section id="panel"><header><span>bms-autobook 1.0</span><button id="minimize" title="Collapse">_</button></header><div id="body"><div id="hint"></div><div id="timer" role="timer">Not running</div><div id="schedule"></div><div id="status" role="status"></div><div id="delivery"></div><div id="controls"><button id="watch">Start</button><button id="choose">Adjust seats</button><button id="stop">Stop</button><button id="profiles">Profiles</button></div><div id="tools" class="hidden"><button id="undo">Undo</button><button id="clear">Clear</button><button id="save">Save seats</button><button id="saveStart">Save &amp; start</button><button id="cancel">Cancel</button></div><details><summary>What happened?</summary><div id="logs"></div></details></div></section>`;
+  </style><div id="zones"></div><section id="panel"><header><span>bms-autobook 1.7</span><button id="minimize" title="Collapse">_</button></header><div id="body"><label>Profile for this tab <select id="tabProfile"></select></label><div id="hint"></div><div id="timer" role="timer">Not running</div><div id="schedule"></div><div id="status" role="status"></div><div id="delivery"></div><div id="controls"><button id="watch">Start</button><button id="choose">Adjust seats</button><button id="stop">Stop</button><button id="profiles">Profiles</button></div><div id="tools" class="hidden"><button id="undo">Undo</button><button id="clear">Clear</button><button id="save">Save seats</button><button id="saveStart">Save &amp; start</button><button id="cancel">Cancel</button></div><details><summary>What happened?</summary><div id="logs"></div></details></div></section>`;
 
   const $ = id => root.getElementById(id);
 
@@ -72,6 +71,14 @@
     profile = state.running && state.profileSnapshot
       ? state.profileSnapshot
       : config.profiles.find(p => p.id === (state.profileId || config.activeProfile)) || config.profiles[0];
+    $('tabProfile').replaceChildren();
+    for (const p of config.profiles) {
+      const option = document.createElement('option');
+      option.value = p.id;
+      option.textContent = `${p.name} • ${p.theatre || 'Theatre not set'}`;
+      $('tabProfile').append(option);
+    }
+    $('tabProfile').value = profile.id;
     render();
     draw();
   }
@@ -88,6 +95,7 @@
   }
 
   function render() {
+    $('tabProfile').disabled = !!state.running || !!editing;
     $('hint').textContent = profile ? `${profile.name} • ${profile.theatre || 'Theatre not set'}` : 'Choose a theatre profile';
     $('status').textContent = editing ? `${editing.zones.length} seat area(s). Drag a box around each seat, then save.` : notice;
     $('schedule').textContent = profile ? `Checks every ${CHECK_MS / 1000}s • Reloads every ${profile.minInterval}-${profile.maxInterval}s • ${state.reloads || 0} reload(s)` : '';
@@ -136,6 +144,16 @@
   }
 
   $('minimize').onclick = () => { $('body').classList.toggle('hidden'); };
+  $('tabProfile').onchange = async () => {
+    try {
+      await send({ type: 'bindProfile', profileId: $('tabProfile').value });
+      await refresh();
+      tell('Profile selected for this tab.');
+    } catch (e) {
+      await refresh().catch(() => {});
+      tell(e.message);
+    }
+  };
   $('profiles').onclick = () => send({ type: 'openSettings' }).catch(e => tell(e.message));
   $('stop').onclick = async () => {
     state.running = false;
@@ -314,6 +332,33 @@
 
     draw(true);
     render();
+  }
+
+  function captureSelectedSeats() {
+    // BookMyShow draws the layout and selected seats on separate stacked canvases.
+    const maps = seatCanvases();
+    if (!maps.some(canvas => seatMarks(canvas).some(mark => mark.selected))) {
+      throw Error('No selected seats are visible in the seat map.');
+    }
+    const layers = maps.map(canvas => ({ canvas, rect: canvas.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.width > 0 && rect.height > 0);
+    if (!layers.length) throw Error('Seat layout is not visible.');
+    const left = Math.min(...layers.map(({ rect }) => rect.left));
+    const top = Math.min(...layers.map(({ rect }) => rect.top));
+    const right = Math.max(...layers.map(({ rect }) => rect.left + rect.width));
+    const bottom = Math.max(...layers.map(({ rect }) => rect.top + rect.height));
+    const scale = Math.max(...layers.map(({ canvas, rect }) => canvas.width / rect.width));
+    const output = document.createElement('canvas');
+    output.width = Math.ceil((right - left) * scale);
+    output.height = Math.ceil((bottom - top) * scale);
+    const ctx = output.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, output.width, output.height);
+    for (const { canvas, rect } of layers) {
+      ctx.drawImage(canvas, (rect.left - left) * scale, (rect.top - top) * scale,
+        rect.width * scale, rect.height * scale);
+    }
+    return output.toDataURL('image/jpeg', 0.95);
   }
 
   // Read complete seat outlines so a small crop cannot move the click onto a border.
@@ -615,8 +660,7 @@
           await update({ nextReload: Date.now() + nextDelayMs }, `Target zones sold out. Reloading in ${Math.round(nextDelayMs / 1000)}s...`);
         }
         if (Date.now() >= state.nextReload) {
-          await update({ reloads: (state.reloads || 0) + 1, nextReload: 0 }, 'Reloading page...');
-          window.location.reload();
+          await send({ type: 'reloadDue', runId: state.runId });
         }
         return;
       }
@@ -721,6 +765,11 @@
   }
 
   api.runtime.onMessage.addListener((message, sender, respond) => {
+    if (message.type === 'backgroundTick') {
+      if (busy) { respond({ ok: true, busy: true }); return false; }
+      tick().then(() => respond({ ok: true }), e => respond({ ok: false, error: e.message }));
+      return true;
+    }
     if (!['refreshState', 'calibrate'].includes(message.type)) return false;
     (async () => {
       await refresh();

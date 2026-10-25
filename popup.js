@@ -23,6 +23,7 @@ function supported(url) {
 }
 
 function render() {
+  $('tabContext').textContent = tab ? `Tab ${tab.id}: ${tab.title || 'BookMyShow'}` : 'Open a BookMyShow tab to select its profile.';
   const complete = !!(current?.theatre && current.email && current.phone && current.discord);
   const seats = !!current?.zones?.length;
   $('running').textContent = state.running ? 'Running' : 'Ready';
@@ -63,7 +64,7 @@ function paintTimer() {
 
 async function load() {
   config = await send({ type: 'config' });
-  if (tab) state = await send({ type: 'state', tabId: tab.id });
+  state = tab ? await send({ type: 'state', tabId: tab.id }) : { running: false };
   current = config.profiles.find(p => p.id === state.profileId) || config.profiles.find(p => p.id === config.activeProfile) || config.profiles[0];
   $('profile').replaceChildren();
   for (const p of config.profiles) {
@@ -135,16 +136,25 @@ $('test').onclick = () => perform(async () => {
   show(await send({ type: 'testNotification', profileId: current.id }));
 });
 
+async function followActiveTab() {
+  const [active] = await api.tabs.query({ active: true, currentWindow: true });
+  tab = supported(active?.url) ? active : null;
+  await load();
+}
+
+api.tabs.onActivated.addListener(() => followActiveTab().catch(e => show(e.message, true)));
+
 (async () => {
   try {
-    [tab] = await api.tabs.query({ active: true, currentWindow: true });
-    if (!supported(tab?.url)) tab = null;
-    await load();
+    await followActiveTab();
     setInterval(paintTimer, 250);
     setInterval(async () => {
       if (working || !tab) return;
       try {
-        state = await send({ type: 'state', tabId: tab.id });
+        const id = tab.id;
+        const next = await send({ type: 'state', tabId: id });
+        if (tab?.id !== id) return;
+        state = next;
         render();
       } catch {}
     }, 2000);

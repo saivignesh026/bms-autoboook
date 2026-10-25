@@ -576,3 +576,149 @@ test('success confirmation starts the cooldown; the content loop resumes only af
   await context.step();
   assert.equal(messages.at(-1), 'resumeMonitoring');
 });
+
+test('tabs keep independent profiles through selection, simultaneous runs, reloads and Stop', async () => {
+  const BMS = require('../core.js');
+  const profiles = ['one', 'two'].map(id => BMS.validateProfile({
+    id, name: id, theatre: id, email: 'test@example.com', phone: '1234567890',
+    discord: 'https://discord.com/api/webhooks/123/test',
+    zones: [{ name: 'Seats', top: 0.1, bottom: 0.2, left: 0.1, right: 0.2 }]
+  }));
+  const local = { config: { schemaVersion: 2, profiles, activeProfile: 'one' } };
+  const store = {}, refreshed = [], reloaded = [];
+  const api = {
+    storage: {
+      local: { setAccessLevel: async () => {}, get: async () => structuredClone(local),
+        set: async patch => Object.assign(local, structuredClone(patch)) },
+      session: { get: async key => key === null ? structuredClone(store) : { [key]: structuredClone(store[key]) },
+        set: async patch => Object.assign(store, structuredClone(patch)),
+        remove: async key => { delete store[key]; } }
+    },
+    runtime: { getURL: path => `moz-extension://companion/${path}`, onMessage: { addListener() {} } },
+    tabs: { reload: async id => { reloaded.push(id); }, get: async id => ({ id, url: `https://in.bookmyshow.com/seat-layout/${id}` }),
+      sendMessage: async (id, message) => { refreshed.push({ id, type: message.type }); return { ok: true }; },
+      onRemoved: { addListener() {} } }
+  };
+  const context = vm.createContext({ browser: api, BMS, structuredClone, URL, Blob, FormData, atob,
+    AbortSignal, crypto: require('node:crypto').webcrypto,
+    fetch: async () => ({ ok: true, json: async () => ({ id: 'confirmed' }) }) });
+  vm.runInContext(fs.readFileSync('background.js', 'utf8'), context);
+  const own = { url: 'moz-extension://companion/popup.html' };
+  const send = (tabId, type, extra = {}) => context.handle({ type, tabId, ...extra }, own);
+  assert.equal((await send(1, 'state')).profileId, 'one');
+  await send(2, 'bindProfile', { profileId: 'two' });
+  assert.equal(local.config.activeProfile, 'one');
+  assert.equal((await send(1, 'state')).profileId, 'one');
+  assert.equal((await send(2, 'state')).profileId, 'two');
+  assert.deepEqual(refreshed, [{ id: 2, type: 'refreshState' }]);
+  // Changing the default in settings must also leave existing tabs pinned.
+  local.config.activeProfile = 'two';
+  assert.equal((await send(1, 'state')).profileId, 'one');
+  assert.equal((await send(3, 'state')).profileId, 'two');
+  await send(1, 'start', { profileId: 'one' });
+  // The page selector must bind its sender tab even if another tab is running.
+  const selected = await context.handle({ type: 'bindProfile', tabId: 1, profileId: 'two' },
+    { tab: await api.tabs.get(2) });
+  assert.equal(selected.id, 'two');
+  assert.equal(selected.discord, undefined);
+  assert.equal((await send(1, 'state')).profileId, 'one');
+  assert.equal((await send(1, 'state')).running, true);
+  await assert.rejects(send(1, 'bindProfile', { profileId: 'two' }), /Stop this tab/);
+  await send(2, 'start', { profileId: 'two' });
+  assert.deepEqual(reloaded, [1, 2]);
+  for (const [id, profileId] of [[1, 'one'], [2, 'two']]) {
+    const state = await context.handle({ type: 'state' }, { tab: await api.tabs.get(id) });
+    assert.equal(state.running, true);
+    assert.equal(state.profileId, profileId);
+    assert.equal(state.profileSnapshot.id, profileId);
+  }
+  await send(2, 'stop');
+  assert.equal((await send(1, 'state')).running, true);
+  assert.equal((await send(2, 'state')).running, false);
+  assert.equal((await send(2, 'state')).profileId, 'two');
+});
+
+test('seat screenshot composites the full layout and selection overlay at their screen positions', () => {
+  const layout = { width: 900, height: 700, getBoundingClientRect: () => ({ left: 10, top: 20, width: 900, height: 700 }) };
+  const overlay = { ...layout };
+  const draws = [], output = {};
+  output.getContext = () => ({ fillRect() {}, drawImage: (...args) => draws.push(args) });
+  output.toDataURL = (type, quality) => { assert.equal(type, 'image/jpeg'); assert.equal(quality, 0.95); return jpeg; };
+  const context = vm.createContext({
+    seatCanvases: () => [layout, overlay],
+    seatMarks: canvas => [{ selected: canvas === overlay }],
+    document: { createElement: () => output }
+  });
+  vm.runInContext(functionSource('  function captureSelectedSeats()', '  // Read complete seat outlines'), context);
+  assert.equal(context.captureSelectedSeats(), jpeg);
+  assert.equal(output.width, 900);
+  assert.equal(output.height, 700);
+  assert.deepEqual(draws, [[layout, 0, 0, 900, 700], [overlay, 0, 0, 900, 700]]);
+  context.seatCanvases = () => [layout];
+  assert.throws(() => context.captureSelectedSeats(), /No selected seats/);
+});
+
+test('popup follows the active tab and unlocks profile selection when that tab is idle', async () => {
+  const source = fs.readFileSync('popup.js', 'utf8');
+  const elements = new Map();
+  const $ = id => {
+    if (!elements.has(id)) elements.set(id, { disabled: false, classList: { toggle() {} }, replaceChildren() {}, append() {} });
+    return elements.get(id);
+  };
+  let active = { id: 1, url: 'https://in.bookmyshow.com/seat-layout/1' };
+  const profiles = [{ id: 'one', name: 'One', zones: [] }, { id: 'two', name: 'Two', zones: [] }];
+  const context = vm.createContext({ URL, $, working: false, tab: null, config: null, current: null, state: {},
+    document: { createElement: () => ({}) }, paintTimer() {},
+    api: { tabs: { query: async () => [active] } },
+    send: async m => m.type === 'config' ? { profiles, activeProfile: 'one' }
+      : { running: m.tabId === 1, profileId: m.tabId === 1 ? 'one' : 'two' } });
+  vm.runInContext(source.slice(source.indexOf('function supported('), source.indexOf('function paintTimer(')), context);
+  vm.runInContext(source.slice(source.indexOf('async function load('), source.indexOf('async function perform(')), context);
+  vm.runInContext(source.slice(source.indexOf('async function followActiveTab('), source.indexOf('api.tabs.onActivated')), context);
+  await context.followActiveTab();
+  assert.equal($('profile').disabled, true);
+  active = { id: 2, url: 'https://in.bookmyshow.com/seat-layout/2' };
+  await context.followActiveTab();
+  assert.equal($('profile').disabled, false);
+  assert.equal($('profile').value, 'two');
+  assert.match($('tabContext').textContent, /Tab 2/);
+});
+
+test('background watchdog nudges every running tab and reloads only overdue watching pages', async () => {
+  const now = Date.now(), sent = [], reloaded = [];
+  const store = {
+    'tab:1': { running: true, runId: 'one', phase: 'watching', nextReload: now - 100, reloads: 0 },
+    'tab:2': { running: true, runId: 'two', phase: 'checkout', nextReload: now - 100 },
+    'tab:3': { running: false, phase: 'watching', nextReload: now - 100 },
+    'tab:4': { running: true, runId: 'four', phase: 'watching', nextReload: now - 100 },
+    'tab:5': { running: true, runId: 'five', phase: 'watching', nextReload: now - 100 }
+  };
+  let alarm;
+  const api = {
+    storage: { local: { setAccessLevel: async () => {} }, session: {
+      get: async key => key === null ? structuredClone(store) : { [key]: structuredClone(store[key]) },
+      set: async patch => Object.assign(store, structuredClone(patch))
+    } },
+    runtime: { getURL: p => `moz-extension://test/${p}`, onMessage: { addListener() {} } },
+    alarms: { create: (name, options) => { alarm = { name, ...options }; }, onAlarm: { addListener() {} } },
+    tabs: { onRemoved: { addListener() {} },
+      sendMessage: async (id, m) => {
+        sent.push([id, m.type]);
+        if (id === 4) return { ok: true, busy: true };
+        if (id === 5) throw Error('No receiver');
+        return { ok: true };
+      }, reload: async id => reloaded.push(id) }
+  };
+  const context = vm.createContext({ browser: api, structuredClone, URL, setTimeout, clearTimeout });
+  vm.runInContext(fs.readFileSync('background.js', 'utf8'), context);
+  await context.watchdog();
+  assert.equal(alarm.name, 'bms-watchdog');
+  assert.deepEqual(sent.map(([id]) => id).sort(), [1, 2, 4, 5]);
+  assert.deepEqual(reloaded.sort(), [1, 5]);
+  assert.equal(store['tab:1'].reloads, 1);
+  assert.equal(store['tab:1'].nextReload, 0);
+  assert.match(store['tab:5'].watchdogError, /No receiver/);
+  assert.equal(store['tab:2'].phase, 'checkout');
+  await context.reloadDue(1);
+  assert.equal(reloaded.length, 2); // One reload per deadline.
+});

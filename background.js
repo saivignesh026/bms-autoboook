@@ -207,8 +207,16 @@ async function handle(m, sender) {
       const c = await configuration();
       return own ? c : { ...c, profiles: c.profiles.map(cleanProfile) };
     }
-    case 'state':
-      return publicState(await read(id));
+    case 'state': {
+      let s = await read(id);
+      if (Number.isInteger(id) && !s.profileId) {
+        const c = await configuration();
+        const p = c.profiles.find(p => p.id === c.activeProfile) || c.profiles[0];
+        // Pin the initial default to this tab before another tab selects a profile.
+        s = await write(id, old => old.profileId ? {} : { profileId: p.id });
+      }
+      return publicState(s);
+    }
     case 'openSettings':
       await api.runtime.openOptionsPage();
       return true;
@@ -237,7 +245,7 @@ async function handle(m, sender) {
     }
     case 'bindProfile':
     case 'prepareLayout': {
-      if (!own) throw Error('Select a profile using the extension.');
+      if (!own && m.type !== 'bindProfile') throw Error('Select a profile using the extension.');
       const s = await read(id);
       if (s.running) throw Error('Stop this tab before changing its profile or seats.');
       const tab = await api.tabs.get(id);
@@ -246,9 +254,8 @@ async function handle(m, sender) {
       const p = c.profiles.find(p => p.id === m.profileId);
       if (!p) throw Error('Select a theatre profile first.');
       await write(id, { profileId: p.id });
-      c.activeProfile = p.id;
-      await api.storage.local.set({ config: c });
-      return p;
+      if (own) await api.tabs.sendMessage(id, { type: 'refreshState' }).catch(() => {});
+      return own ? p : cleanProfile(p);
     }
     case 'zones': {
       if (!sender.tab) throw Error('Choose seats on the page.');
@@ -321,13 +328,12 @@ async function handle(m, sender) {
       };
       await sessions.set({ [key(id)]: s });
       await sessions.remove(`assets:${id}`);
-      await log(id, 'Started. Next seat check in 2 seconds.');
+      await log(id, 'Started. Reloading this tab once before scanning.');
       try {
-        const r = await api.tabs.sendMessage(id, { type: 'refreshState' });
-        if (r?.ok === false) throw Error(r.error);
+        await api.tabs.reload(id);
       } catch {
         await write(id, { running: false });
-        throw Error('Page helper unavailable. Reload BookMyShow, then start again.');
+        throw Error('Could not reload this tab. Reload BookMyShow, then start again.');
       }
       return publicState(await read(id));
     }
@@ -377,6 +383,12 @@ async function handle(m, sender) {
       await log(id, m.reason ? `Stopped: ${String(m.reason).slice(0, 400)}` : 'Stopped.');
       api.tabs.sendMessage(id, { type: 'refreshState' }).catch(() => {});
       return true;
+    }
+    case 'reloadDue': {
+      if (!sender.tab) throw Error('Booking-page message required.');
+      const s = await read(id);
+      if (!s.running || s.runId !== m.runId) throw Error('Run stopped or changed.');
+      return reloadDue(id);
     }
     case 'update': {
       if (!sender.tab) throw Error('Page message required.');
@@ -468,8 +480,76 @@ async function handle(m, sender) {
   }
 }
 
+// Background scheduling does not depend on the booking page's timer budget.
+const watchdogTabs = new Set();
+async function reloadDue(id) {
+  let claimed = false;
+  const s = await write(id, old => {
+    if (!old.running || old.phase !== 'watching' || !old.nextReload || Date.now() < old.nextReload) return {};
+    claimed = true;
+    return { nextReload: 0, reloads: (old.reloads || 0) + 1 };
+  });
+  if (!claimed || !(await read(id)).running) return false;
+  try {
+    await api.tabs.reload(id);
+    await log(id, 'Reloaded seat map from background scheduler.', s.runId);
+  } catch (e) {
+    await log(id, `Background reload failed: ${e.message}`, s.runId);
+  }
+  return true;
+}
+
+async function watchdogTab(id) {
+  if (watchdogTabs.has(id)) return;
+  watchdogTabs.add(id);
+  let timeout;
+  try {
+    const s = await read(id);
+    if (!s.running) return;
+    await handle({ type: 'retryDelivery', tabId: id }, { url: api.runtime.getURL('background.js') });
+    const result = await Promise.race([
+      api.tabs.sendMessage(id, { type: 'backgroundTick' }),
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(Error('Page response timed out')), 8000); })
+    ]);
+    if (result?.ok === false) throw Error(result.error);
+    const latest = await read(id);
+    if (latest.watchdogError) await write(id, { watchdogError: '' });
+    // Only reload an overdue watching page that was not busy selecting seats.
+    if (!result?.busy) await reloadDue(id);
+  } catch (e) {
+    const latest = await read(id);
+    if (latest.running) {
+      if (!latest.watchdogError) await log(id, `Background check: ${e.message}. Will retry.`, latest.runId);
+      await write(id, { watchdogError: e.message });
+      // Never reload checkout/payment to recover a missing content script.
+      await reloadDue(id);
+    }
+  } finally {
+    clearTimeout(timeout);
+    watchdogTabs.delete(id);
+  }
+}
+
+async function watchdog() {
+  const all = await sessions.get(null);
+  await Promise.allSettled(Object.entries(all)
+    .filter(([k, s]) => k.startsWith('tab:') && s.running)
+    .map(([k]) => watchdogTab(Number(k.slice(4)))));
+}
+
+if (api.alarms) {
+  api.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name === 'bms-watchdog') void watchdog();
+  });
+  api.alarms.create('bms-watchdog', { periodInMinutes: 0.5 });
+  // Firefox background pages can also send frequent nudges between alarms.
+  if (api.runtime.getBrowserInfo && typeof setInterval === 'function') {
+    setInterval(() => { void watchdog(); }, 2000);
+  }
+}
+
 api.runtime.onMessage.addListener((m, sender, respond) => {
-  const immediate = ['config', 'state', 'stop', 'openSettings', 'retryDelivery', 'capturePage'].includes(m.type);
+  const immediate = ['config', 'state', 'stop', 'openSettings', 'retryDelivery', 'capturePage', 'update', 'reloadDue'].includes(m.type);
   const task = immediate ? handle(m, sender) : serial.then(() => handle(m, sender));
   if (!immediate) serial = task.catch(() => {});
   task.then(data => respond({ ok: true, data }), e => respond({ ok: false, error: e.message }));
